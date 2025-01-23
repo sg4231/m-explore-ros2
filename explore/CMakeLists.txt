@@ -17,8 +17,9 @@ endif()
 
 # Set flag depending on distro
 if(NOT DEFINED ENV{ROS_DISTRO})
-  message(FATAL_ERROR "ROS_DISTRO is not defined." )
+  message(FATAL_ERROR "ROS_DISTRO is not defined.")
 endif()
+
 if("$ENV{ROS_DISTRO}" STREQUAL "eloquent")
   message(STATUS "Build for ROS2 eloquent")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DELOQUENT")
@@ -42,7 +43,7 @@ find_package(nav_msgs REQUIRED)
 find_package(map_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
-
+find_package(explore_interfaces REQUIRED)
 
 set(DEPENDENCIES
   rclcpp
@@ -56,10 +57,11 @@ set(DEPENDENCIES
   map_msgs
   nav2_costmap_2d
   visualization_msgs
+  explore_interfaces
 )
 
 include_directories(
-    include
+  include
 )
 
 install(
@@ -76,7 +78,6 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
-
 add_executable(explore
   src/costmap_client.cpp
   src/explore.cpp
@@ -87,7 +88,6 @@ target_include_directories(explore PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
-
 target_link_libraries(explore ${rclcpp_LIBRARIES})
 
 ament_target_dependencies(explore ${DEPENDENCIES})
@@ -97,11 +97,12 @@ install(TARGETS explore
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${GAZEBO_CXX_FLAGS}")
 
-#############
-## Testing ##
-#############
+# ############
+# # Testing ##
+# ############
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+
   # the following line skips the linter which checks for copyrights
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
@@ -112,10 +113,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_explore test/test_explore.cpp)
   target_link_libraries(test_explore ${catkin_LIBRARIES})
   ament_target_dependencies(test_explore ${DEPENDENCIES})
-
-  
 endif()
-
 
 ament_export_include_directories(include)
 ament_package()

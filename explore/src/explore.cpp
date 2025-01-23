@@ -81,9 +81,6 @@ Explore::Explore()
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
   progress_timeout_ = timeout;
-  move_base_client_ =
-      rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
-          this, ACTION_NAME);
 
   search_ = frontier_exploration::FrontierSearch(costmap_client_.getCostmap(),
                                                  potential_scale_, gain_scale_,
@@ -97,51 +94,16 @@ Explore::Explore()
                                                                      10);
   }
 
-  // Subscription to resume or stop exploration
-  resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
-      "explore/resume", 10,
-      std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
+  // subscription
+  black_point_sub_ = this->create_subscription<geometry_msgs::msg::Point>(
+    "/black_point", 10,
+    std::bind(&Explore::black_point_callback, this, std::placeholders::_1)
+  );
 
-  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
-  move_base_client_->wait_for_action_server();
-  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
-
-  if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Getting initial pose of the robot");
-    geometry_msgs::msg::TransformStamped transformStamped;
-    std::string map_frame = costmap_client_.getGlobalFrameID();
-    try {
-      transformStamped = tf_buffer_.lookupTransform(
-          map_frame, robot_base_frame_, tf2::TimePointZero);
-      initial_pose_.position.x = transformStamped.transform.translation.x;
-      initial_pose_.position.y = transformStamped.transform.translation.y;
-      initial_pose_.orientation = transformStamped.transform.rotation;
-    } catch (tf2::TransformException& ex) {
-      RCLCPP_ERROR(logger_, "Couldn't find transform from %s to %s: %s",
-                   map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
-      return_to_init_ = false;
-    }
-  }
-
-  exploring_timer_ = this->create_wall_timer(
-      std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
-      [this]() { makePlan(); });
-  // Start exploration right away
-  makePlan();
-}
-
-Explore::~Explore()
-{
-  stop();
-}
-
-void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
-{
-  if (msg->data) {
-    resume();
-  } else {
-    stop();
-  }
+  // create explore server
+  explore_server_ = this->create_service<explore_interfaces::srv::GetGoal>(
+    "/explore_service", std::bind(&Explore::makePlan, this, std::placeholders::_1, std::placeholders::_2)
+  );
 }
 
 void Explore::visualizeFrontiers(
@@ -236,8 +198,13 @@ void Explore::visualizeFrontiers(
   marker_array_publisher_->publish(markers_msg);
 }
 
-void Explore::makePlan()
+void Explore::makePlan(
+  const std::shared_ptr<explore_interfaces::srv::GetGoal::Request> request,
+  std::shared_ptr<explore_interfaces::srv::GetGoal::Response> response
+)
 {
+  response->success = true;
+
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
@@ -249,7 +216,7 @@ void Explore::makePlan()
 
   if (frontiers.empty()) {
     RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    stop(true);
+    response->success = false;
     return;
   }
 
@@ -266,74 +233,15 @@ void Explore::makePlan()
                        });
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    stop(true);
+    response->success = false;
     return;
   }
-  geometry_msgs::msg::Point target_position = frontier->centroid;
+  geometry_msgs::msg::PoseStamped target_pose;
+  target_pose.header.stamp = this->get_clock()->now();
+  target_pose.header.frame_id = "map";
+  target_pose.pose.position = frontier->centroid;
 
-  // time out if we are not making any progress
-  bool same_goal = same_point(prev_goal_, target_position);
-
-  prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
-    // we have different goal or we made some progress
-    last_progress_ = this->now();
-    prev_distance_ = frontier->min_distance;
-  }
-  // black list if we've made no progress for a long time
-  if ((this->now() - last_progress_ >
-      tf2::durationFromSec(progress_timeout_)) && !resuming_) {
-    frontier_blacklist_.push_back(target_position);
-    RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-    makePlan();
-    return;
-  }
-
-  // ensure only first call of makePlan was set resuming to true
-  if (resuming_) {
-    resuming_ = false;
-  }
-
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal) {
-    return;
-  }
-
-  RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
-
-  // send goal to move_base if we have something new to pursue
-  auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = target_position;
-  goal.pose.pose.orientation.w = 1.;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
-
-  auto send_goal_options =
-      rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
-  send_goal_options.result_callback =
-      [this,
-       target_position](const NavigationGoalHandle::WrappedResult& result) {
-        reachedGoal(result, target_position);
-      };
-  move_base_client_->async_send_goal(goal, send_goal_options);
-}
-
-void Explore::returnToInitialPose()
-{
-  RCLCPP_INFO(logger_, "Returning to initial pose.");
-  auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = initial_pose_.position;
-  goal.pose.pose.orientation = initial_pose_.orientation;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
-
-  auto send_goal_options =
-      rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  move_base_client_->async_send_goal(goal, send_goal_options);
+  response->goal = target_pose;
 }
 
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
@@ -353,65 +261,17 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
   return false;
 }
 
-void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
-                          const geometry_msgs::msg::Point& frontier_goal)
-{
-  switch (result.code) {
-    case rclcpp_action::ResultCode::SUCCEEDED:
-      RCLCPP_DEBUG(logger_, "Goal was successful");
-      break;
-    case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_DEBUG(logger_, "Goal was aborted");
-      frontier_blacklist_.push_back(frontier_goal);
-      RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-      // If it was aborted probably because we've found another frontier goal,
-      // so just return and don't make plan again
-      return;
-    case rclcpp_action::ResultCode::CANCELED:
-      RCLCPP_DEBUG(logger_, "Goal was canceled");
-      // If goal canceled might be because exploration stopped from topic. Don't make new plan.
-      return;
-    default:
-      RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
-      break;
-  }
-  // find new goal immediately regardless of planning frequency.
-  // execute via timer to prevent dead lock in move_base_client (this is
-  // callback for sendGoal, which is called in makePlan). the timer must live
-  // until callback is executed.
-  // oneshot_ = relative_nh_.createTimer(
-  //     ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
-  //     true);
-
-  // Because of the 1-thread-executor nature of ros2 I think timer is not
-  // needed.
-  makePlan();
-}
-
 void Explore::start()
 {
   RCLCPP_INFO(logger_, "Exploration started.");
 }
 
-void Explore::stop(bool finished_exploring)
+void Explore::black_point_callback(
+  std::shared_ptr<geometry_msgs::msg::Point> msg
+)
 {
-  RCLCPP_INFO(logger_, "Exploration stopped.");
-  move_base_client_->async_cancel_all_goals();
-  exploring_timer_->cancel();
-
-  if (return_to_init_ && finished_exploring) {
-    returnToInitialPose();
-  }
-}
-
-void Explore::resume()
-{
-  resuming_ = true;
-  RCLCPP_INFO(logger_, "Exploration resuming.");
-  // Reactivate the timer
-  exploring_timer_->reset();
-  // Resume immediately
-  makePlan();
+  frontier_blacklist_.push_back(*msg);
+  return;
 }
 
 }  // namespace explore
